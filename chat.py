@@ -1,8 +1,16 @@
 ########################################################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
-
+import logging
 import os, copy, types, gc, sys
+import uuid
+from flask_socketio import SocketIO
+# Import flask session and uuid
+from flask import session
+import uuid
+current_path = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(f'{current_path}/../rwkv_pip_package/src')
+
 import numpy as np
 from prompt_toolkit import prompt
 try:
@@ -12,14 +20,22 @@ except:
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 args = types.SimpleNamespace()
 
-print('\n\nChatRWKV project: https://github.com/BlinkDL/ChatRWKV')
-for i in range(10):
-    print('NOTE: This code is v1 and only for reference. Use v2 instead.')
+print('\n\nChatRWKV v2 https://github.com/BlinkDL/ChatRWKV')
 
 import torch
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
+socketio = None
+def init_chat(socketio):
+    def handle_user_message(data):
+        session_id = data['session_id']
+        message = data['message']
+        response = process_message(session_id, message, socketio)
+        socketio.emit('bot_response', {'response': response})
+
+    socketio.on('user_message', handle_user_message)
+    
 
 # Tune these below (test True/False for all of them) to find the fastest setting:
 # torch._C._jit_set_profiling_executor(True)
@@ -30,421 +46,433 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # torch._C._jit_set_nvfuser_enabled(False)
 
 ########################################################################################################
+#
+# fp16 = good for GPU (!!! DOES NOT support CPU !!!)
+# fp32 = good for CPU
+# bf16 = less accuracy, supports some CPUs
+# xxxi8 (example: fp16i8) = xxx with int8 quantization to save 50% VRAM/RAM, slightly less accuracy
+#
+# Read https://pypi.org/project/rwkv/ for Strategy Guide
+#
+########################################################################################################
 
-args.RUN_DEVICE = "cuda"  # cuda // cpu
-# fp16 (good for GPU, does NOT support CPU) // fp32 (good for CPU) // bf16 (worse accuracy, supports CPU)
-args.FLOAT_MODE = "fp16"
+# args.strategy = 'cpu fp32'
+#args.strategy = 'cuda fp16i8 *0+ -> cpu fp32 *1'
+# args.strategy = 'cuda:0 fp16 -> cuda:1 fp16'
+# args.strategy = 'cuda fp16i8 *10 -> cuda fp16'
+args.strategy = 'cuda fp16i8 *0+ -> cpu fp32 *1'
+# args.strategy = 'cuda fp16i8 -> cpu fp32 *10'
+# args.strategy = 'cuda fp16i8 *10+'
 
 os.environ["RWKV_JIT_ON"] = '1' # '1' or '0', please use torch 1.13+ and benchmark speed
+os.environ["RWKV_CUDA_ON"] = '1' # '1' to compile CUDA kernel (10x faster), requires c++ compiler & cuda libraries
 
 CHAT_LANG = 'English' # English // Chinese // more to come
 
-QA_PROMPT = False # True: Q & A prompt // False: User & Bot prompt
-# 中文问答设置QA_PROMPT=True（只能问答，问答效果更好，但不能闲聊） 中文聊天设置QA_PROMPT=False（可以闲聊，但需要大模型才适合闲聊）
-
-# Download RWKV-4 models from https://huggingface.co/BlinkDL (don't use Instruct-test models unless you use their prompt templates)
-
+# Download RWKV models from https://huggingface.co/BlinkDL
+# Use '/' in model path, instead of '\'
+# Use convert_model.py to convert a model for a strategy, for faster loading & saves CPU RAM 
 if CHAT_LANG == 'English':
-    args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-14b/RWKV-4-Pile-14B-20230228-ctx4096-test663'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-7b/RWKV-4-Pile-7B-20221115-8047'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-3b/RWKV-4-Pile-3B-20221110-ctx4096'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-1b5/RWKV-4-Pile-1B5-20220903-8040'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-430m/RWKV-4-Pile-430M-20220808-8066'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-169m/RWKV-4-Pile-169M-20220807-8023'
-    # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/7-run1z/rwkv-340'
-    # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/14b-run1/rwkv-6210'
+    args.MODEL_NAME = 'RWKV-4-Raven-14B-v10-Eng99%-Other1%-20230427-ctx8192-fp16i820.pth'
+    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-7B-v10-Eng99%-Other1%-20230418-ctx8192'
+    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-14b/RWKV-4-Pile-14B-20230313-ctx8192-test1050'
 
-elif CHAT_LANG == 'Chinese': # testNovel系列是网文模型，请只用 +gen 指令续写。test4 系列可以问答（只用了小中文语料微调，纯属娱乐）
-    args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-7b/RWKV-4-Pile-7B-EngChn-testNovel-441-ctx2048-20230217'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-3b/RWKV-4-Pile-3B-EngChn-testNovel-711-ctx2048-20230216'
-    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-1b5/RWKV-4-Pile-1B5-EngChn-testNovel-671-ctx2048-20230216'
-    # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/7-run1z/rwkv-973'
-    # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/3-run1z/rwkv-711'
-    # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/1.5-run1z/rwkv-671'
+elif CHAT_LANG == 'Chinese': # Raven系列可以对话和 +i 问答。Novel系列是小说模型，请只用 +gen 指令续写。
+    args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-7B-v9x-Eng49%-Chn50%-Other1%-20230418-ctx4096'
+    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-novel/RWKV-4-Novel-7B-v1-ChnEng-20230409-ctx4096'
 
-args.ctx_len = 1024
+elif CHAT_LANG == 'Japanese':
+    args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-14B-v8-EngAndMore-20230408-ctx4096'
+    # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-7B-v9-Eng86%-Chn10%-JpnEspKor2%-Other2%-20230414-ctx4096'
+
+# -1.py for [User & Bot] (Q&A) prompt
+# -2.py for [Bob & Alice] (chat) prompt
+PROMPT_FILE = f'{current_path}/prompt/default/{CHAT_LANG}-2.py'
 
 CHAT_LEN_SHORT = 40
-CHAT_LEN_LONG = 150
-FREE_GEN_LEN = 200
+CHAT_LEN_LONG = 200
+FREE_GEN_LEN = 256
 
-GEN_TEMP = 1.0
-GEN_TOP_P = 0.85
+# For better chat & QA quality: reduce temp, reduce top-p, increase repetition penalties
+# Explanation: https://platform.openai.com/docs/api-reference/parameter-details
+GEN_TEMP = 0.8 # It could be a good idea to increase temp when top_p is low
+GEN_TOP_P = 0.5 # Reduce top_p (to 0.5, 0.2, 0.1 etc.) for better Q&A accuracy (and less diversity)
+GEN_alpha_presence = 0.2 # Presence Penalty
+GEN_alpha_frequency = 0.2 # Frequency Penalty
+AVOID_REPEAT = '，：？！'
 
-AVOID_REPEAT = '，。：？！'
+CHUNK_LEN = 256 # split input into chunks to save VRAM (shorter -> slower)
+
+# args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-7B-v9-Eng86%-Chn10%-JpnEspKor2%-Other2%-20230414-ctx4096'
+# args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-raven/RWKV-4-Raven-3B-v9x-Eng49%-Chn50%-Other1%-20230417-ctx4096'
+# args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/7-ENZH/rwkv-88'
+# args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/7-JP/rwkv-5'
 
 ########################################################################################################
+# 1. Add a chat_session dictionary
+chat_sessions = {}
 
-os.environ["RWKV_RUN_DEVICE"] = args.RUN_DEVICE
-print(f'\nLoading ChatRWKV - {CHAT_LANG} - {args.RUN_DEVICE} - {args.FLOAT_MODE} - QA_PROMPT {QA_PROMPT}')
+# 2. Use request.sid to identify the session
+def handle_message(session_id, message):
+    session_id = request.sid
+    if session_id not in chat_sessions:
+        chat_sessions[session_id] = {'bot': copy.deepcopy(bot), 'user': copy.deepcopy(user)}
+        bot = chat_sessions[session_id]['bot']
+        user = chat_sessions[session_id]['user']
 
-from src.model_run import RWKV_RNN
-from src.utils import TOKENIZER
-tokenizer = TOKENIZER("20B_tokenizer.json")
+    message = message.strip()
+    if message:
+        user.add(message)
+        response = interface(user, bot, model, pipeline, chunk_len=CHUNK_LEN, top_p=GEN_TOP_P, temp=GEN_TEMP, repetition_penalty=[GEN_alpha_presence, GEN_alpha_frequency], avoid_tokens=AVOID_REPEAT_TOKENS)
+        bot.add(response)
 
-args.vocab_size = 50277
-args.head_qk = 0
-args.pre_ffn = 0
-args.grad_cp = 0
-args.my_pos_emb = 0
-MODEL_NAME = args.MODEL_NAME
+    # 3. Include session_id as the first argument
+        socketio.emit('bot_response', (session_id, {'response': response}), broadcast=True)
 
-if CHAT_LANG == 'English':
-    interface = ":"
 
-    if QA_PROMPT:
-        user = "User"
-        bot = "Bot" # Or: 'The following is a verbose and detailed Q & A conversation of factual information.'
-        init_prompt = f'''
-The following is a verbose and detailed conversation between an AI assistant called {bot}, and a human user called {user}. {bot} is intelligent, knowledgeable, wise and polite.
+def on_connect():
+    session_id = request.sid
+    chat_sessions[session_id] = {'bot': copy.deepcopy(bot), 'user': copy.deepcopy(user)}
 
-{user}{interface} french revolution what year
 
-{bot}{interface} The French Revolution started in 1789, and lasted 10 years until 1799.
+def on_disconnect():
+    session_id = request.sid
+    if session_id in chat_session:
+        del chat_session[session_id]
+        
+print(f'\n{CHAT_LANG} - {args.strategy} - {PROMPT_FILE}')
+from rwkv.model import RWKV
+from rwkv.utils import PIPELINE
 
-{user}{interface} 3+5=?
-
-{bot}{interface} The answer is 8.
-
-{user}{interface} guess i marry who ?
-
-{bot}{interface} Only if you tell me more about yourself - what are your interests?
-
-{user}{interface} solve for a: 9-a=2
-
-{bot}{interface} The answer is a = 7, because 9 - 7 = 2.
-
-{user}{interface} wat is lhc
-
-{bot}{interface} LHC is a high-energy particle collider, built by CERN, and completed in 2008. They used it to confirm the existence of the Higgs boson in 2012.
-
-'''        
-    else:
-        user = "Bob"
-        bot = "Alice"
-        init_prompt = f'''
-The following is a verbose detailed conversation between {user} and a young girl {bot}. {bot} is intelligent, friendly and cute. {bot} is unlikely to disagree with {user}.
-
-{user}{interface} Hello {bot}, how are you doing?
-
-{bot}{interface} Hi {user}! Thanks, I'm fine. What about you?
-
-{user}{interface} I am very good! It's nice to see you. Would you mind me chatting with you for a while?
-
-{bot}{interface} Not at all! I'm listening.
-
-'''
-
-    HELP_MSG = '''Commands:
-say something --> chat with bot. use \\n for new line.
-+ --> alternate chat reply
-+reset --> reset chat
-
-+gen YOUR PROMPT --> free generation with any prompt. use \\n for new line.
-+qa YOUR QUESTION --> free generation - ask any question (just ask the question). use \\n for new line.
-+++ --> continue last free generation (only for +gen / +qa)
-++ --> retry last free generation (only for +gen / +qa)
-
-Now talk with the bot and enjoy. Remember to +reset periodically to clean up the bot's memory. Use RWKV-4 14B for best results.
-This is not instruct-tuned for conversation yet, so don't expect good quality. Better use +gen for free generation.
-
-Prompt is VERY important. Try all prompts on https://github.com/BlinkDL/ChatRWKV first.
-'''
-elif CHAT_LANG == 'Chinese':
-    interface = ":"
-    if QA_PROMPT:
-        user = "Q"
-        bot = "A"
-        init_prompt = f'''
-Expert Questions & Helpful Answers
-
-Ask Research Experts
-
-'''
-    else:
-        user = "User"
-        bot = "Bot"
-        init_prompt = f'''
-The following is a verbose and detailed conversation between an AI assistant called {bot}, and a human user called {user}. {bot} is intelligent, knowledgeable, wise and polite.
-
-{user}{interface} wat is lhc
-
-{bot}{interface} LHC is a high-energy particle collider, built by CERN, and completed in 2008. They used it to confirm the existence of the Higgs boson in 2012.
-
-{user}{interface} 企鹅会飞吗
-
-{bot}{interface} 企鹅是不会飞的。它们的翅膀主要用于游泳和平衡，而不是飞行。
-
-'''
-    HELP_MSG = f'''指令:
-
-直接输入内容 --> 和机器人聊天（建议问机器人问题），用\\n代表换行
-+ --> 让机器人换个回答
-+reset --> 重置对话
-
-+gen 某某内容 --> 续写任何中英文内容，用\\n代表换行
-+qa 某某问题 --> 问独立的问题（忽略上下文），用\\n代表换行
-+qq 某某问题 --> 问独立的问题（忽略上下文），且敞开想象力，用\\n代表换行
-+++ --> 继续 +gen / +qa / +qq 的回答
-++ --> 换个 +gen / +qa / +qq 的回答
-
-作者：彭博 请关注我的知乎: https://zhuanlan.zhihu.com/p/603840957
-
-如果喜欢，请看我们的优质护眼灯: https://withablink.taobao.com
-
-现在可以输入内容和机器人聊天（注意它不大懂中文，它更懂英文）。请经常使用 +reset 重置机器人记忆。
-目前没有“重复惩罚”，所以机器人有时会重复，此时必须使用 + 换成正常回答，以免污染电脑记忆。
-注意：和上下文无关的独立问题，必须用 +qa 或 +qq 问，以免污染电脑记忆。
-
-请先试下列咒语，理解咒语的写法。咒语至关重要。
-
-中文网文【testNovel】模型，试下面这些，注意，必须是【testNovel】模型：
-+gen 这是一颗
-+gen 以下是不朽的科幻史诗长篇巨著，描写细腻，刻画了数百位个性鲜明的英雄和宏大的星际文明战争。\\n第一章
-+gen 这是一个修真世界，详细世界设定如下：\\n1.
-
-中文问答【test数字】模型，试下面这些，注意，必须是【test数字】模型：
-+gen \\n活动出席发言稿：\\n大家好，
-+gen \\n怎样创立一家快速盈利的AI公司：\\n1.
-+gen \\nimport torch
-+qq 请以《我的驴》为题写一篇作文
-+qq 请以《企鹅》为题写一首诗歌
-+qq 请设定一个奇幻世界，告诉我详细的世界设定。
-'''
+def load_prompt(PROMPT_FILE):
+    variables = {}
+    with open(PROMPT_FILE, 'rb') as file:
+        exec(compile(file.read(), PROMPT_FILE, 'exec'), variables)
+    user, bot, interface, init_prompt = variables['user'], variables['bot'], variables['interface'], variables['init_prompt']
+    init_prompt = init_prompt.strip().split('\n')
+    for c in range(len(init_prompt)):
+        init_prompt[c] = init_prompt[c].strip().strip('\u3000').strip('\r')
+    init_prompt = '\n' + ('\n'.join(init_prompt)).strip() + '\n\n'
+    return user, bot, interface, init_prompt
 
 # Load Model
 
-print(f'Loading model - {MODEL_NAME}')
-model = RWKV_RNN(args)
+print(f'Loading model - {args.MODEL_NAME}')
+model = RWKV(model=args.MODEL_NAME, strategy=args.strategy)
+pipeline = PIPELINE(model, f"{current_path}/20B_tokenizer.json")
+END_OF_TEXT = 0
+END_OF_LINE = 187
+# pipeline = PIPELINE(model, "cl100k_base")
+# END_OF_TEXT = 100257
+# END_OF_LINE = 198
 
 model_tokens = []
 model_state = None
 
 AVOID_REPEAT_TOKENS = []
 for i in AVOID_REPEAT:
-    dd = tokenizer.encode(i)
+    dd = pipeline.encode(i)
     assert len(dd) == 1
     AVOID_REPEAT_TOKENS += dd
 
 ########################################################################################################
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+class ChatSession:
+    def __init__(self, model, pipeline):
+        self.model = model
+        self.pipeline = pipeline
+        self.model_tokens = []
+        self.model_state = None
+        self.all_state = {}
+        self.user = "user"
+        self.bot = "bot"
+        self.interface = "interface"
+        # Initialize the session
+        self.initialize_session()
 
-def run_rnn(tokens, newline_adj = 0):
-    global model_tokens, model_state
+    def initialize_session(self):
+        logging.info("Initializing chat session.")
+        user, self.bot, self.interface, init_prompt = load_prompt(PROMPT_FILE)
+        out = self.run_rnn(self.pipeline.encode(init_prompt))
+        self.save_all_stat('', 'chat_init', out)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    tokens = [int(x) for x in tokens]
-    model_tokens += tokens
-    out, model_state = model.forward(tokens, model_state)
+        srv_list = ['dummy_server']
+        for s in srv_list:
+            self.save_all_stat(s, 'chat', out)
 
-    # print(f'### model ###\n{tokens}\n[{tokenizer.decode(model_tokens)}]')
+    def run_rnn(self, tokens, newline_adj=0):
+        logging.info("Running RNN with tokens: %s", tokens)
+        tokens = [int(x) for x in tokens]
+        self.model_tokens += tokens
 
-    out[0] = -999999999  # disable <|endoftext|>
-    out[187] += newline_adj # adjust \n probability
-    # if newline_adj > 0:
-    #     out[15] += newline_adj / 2 # '.'
-    if model_tokens[-1] in AVOID_REPEAT_TOKENS:
-        out[model_tokens[-1]] = -999999999
-    return out
+        while len(tokens) > 0:
+            out, self.model_state = self.model.forward(tokens[:CHUNK_LEN], self.model_state)
+            tokens = tokens[CHUNK_LEN:]
 
-all_state = {}
-def save_all_stat(srv, name, last_out):
-    n = f'{name}_{srv}'
-    all_state[n] = {}
-    all_state[n]['out'] = last_out
-    all_state[n]['rnn'] = copy.deepcopy(model_state)
-    all_state[n]['token'] = copy.deepcopy(model_tokens)
+        out[END_OF_LINE] += newline_adj  # adjust \n probability
 
-def load_all_stat(srv, name):
-    global model_tokens, model_state
-    n = f'{name}_{srv}'
-    model_state = copy.deepcopy(all_state[n]['rnn'])
-    model_tokens = copy.deepcopy(all_state[n]['token'])
-    return all_state[n]['out']
+        if self.model_tokens[-1] in AVOID_REPEAT_TOKENS:
+            out[self.model_tokens[-1]] = -999999999
+        return out
+
+    def save_all_stat(self, srv, name, last_out):
+        logging.info("Saving state for srv: %s, name: %s", srv, name)
+        n = f'{name}_{srv}'
+        self.all_state[n] = {}
+        self.all_state[n]['out'] = last_out
+        self.all_state[n]['rnn'] = copy.deepcopy(self.model_state)
+        self.all_state[n]['token'] = copy.deepcopy(self.model_tokens)
+
+    def load_all_stat(self, srv, name):
+        logging.info("Loading state for srv: %s, name: %s", srv, name)
+        n = f'{name}_{srv}'
+        self.model_state = copy.deepcopy(self.all_state[n]['rnn'])
+        self.model_tokens = copy.deepcopy(self.all_state[n]['token'])
+        return self.all_state[n]['out']
+
+    def reply_msg(self, msg):
+        return f'{self.bot}{self.interface} {msg}\n'
+
+    def generate_response(self, message):
+        logging.info("Generating Response")
+        response = ''
+        srv = 'dummy_server'
+
+        msg = message.replace('\\n', '\n').strip()
+
+        x_temp = GEN_TEMP
+        x_top_p = GEN_TOP_P
+        if ("-temp=" in msg):
+            x_temp = float(msg.split("-temp=")[1].split(" ")[0])
+            msg = msg.replace("-temp=" + f'{x_temp:g}', "")
+        if ("-top_p=" in msg):
+            x_top_p = float(msg.split("-top_p=")[1].split(" ")[0])
+            msg = msg.replace("-top_p=" + f'{x_top_p:g}', "")
+        if x_temp <= 0.2:
+            x_temp = 0.2
+        if x_temp >= 5:
+            x_temp = 5
+        if x_top_p <= 0:
+            x_top_p = 0
+        msg = msg.strip()
+
+        if msg == '+reset':
+            out = self.load_all_stat('', 'chat_init')
+            self.save_all_stat(srv, 'chat', out)
+            return self.reply_msg("Chat reset.")
+        elif msg[:8].lower() == '+prompt ':
+            response += "Loading prompt..."
+            try:
+                PROMPT_FILE = msg[8:].strip()
+                user, self.bot, self.interface, init_prompt = load_prompt(PROMPT_FILE)
+                out = self.run_rnn(self.pipeline.encode(init_prompt))
+                self.save_all_stat(srv, 'chat', out)
+                response += "Prompt set up."
+                gc.collect()
+                torch.cuda.empty_cache()
+            except:
+                response += "Path error."
+        elif msg[:5].lower() == '+gen ' or msg[:3].lower() == '+i ' or msg[:4].lower() == '+qa ' or msg[:4].lower() == '+qq ' or msg.lower() == '+++' or msg.lower() == '++':
+
+            if msg[:5].lower() == '+gen ':
+                new = '\n' + msg[5:].strip()
+                model_state = None
+                self.model_tokens = []
+                out = run_rnn(pipeline.encode(new))
+                self.save_all_stat(srv, 'gen_0', out)
+
+            elif msg[:3].lower() == '+i ':
+                msg = msg[3:].strip().replace('\r\n', '\n').replace('\n\n', '\n')
+                new = f'''
+
+
+                # Create a new chat session.
+
+
+
+                # Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+                # Instruction:
+{msg}
+
+                # Response:
+'''
+                chat_session = ChatSession(model, pipeline)
+                model_state = None
+                self.model_tokens = []
+                out = run_rnn(pipeline.encode(new))
+                save_all_stat(srv, 'gen_0', out)
+
+            elif msg[:4].lower() == '+qq ':
+                new = '\nQ: ' + msg[4:].strip() + '\nA:'
+                model_state = None
+                self.model_tokens = []
+                out = run_rnn(pipeline.encode(new))
+                save_all_stat(srv, 'gen_0', out)
+
+            elif msg[:4].lower() == '+qa ':
+                out = load_all_stat('', 'chat_init')
+
+                real_msg = msg[4:].strip()
+                new = f"{user}{interface} {real_msg}\n\n{self.bot}{self.interface}"
+                out = generate_response(pipeline.encode(new))
+                save_all_stat(srv, 'gen_0', out)
+
+            elif msg.lower() == '+++':
+                try:
+                    out = load_all_stat(srv, 'gen_1')
+                    save_all_stat(srv, 'gen_0', out)
+                except:
+                    return
+
+            elif msg.lower() == '++':
+                try:
+                    out = load_all_stat(srv, 'gen_0')
+                except:
+                    return
+
+            begin = len(self.model_tokens)
+            out_last = begin
+            occurrence = {}
+            for i in range(FREE_GEN_LEN + 100):
+                for n in occurrence:
+                    out[n] -= (GEN_alpha_presence + occurrence[n] * GEN_alpha_frequency)
+                token = pipeline.sample_logits(
+                    out,
+                    temperature=x_temp,
+                    top_p=x_top_p,
+                )
+                if token == END_OF_TEXT:
+                    break
+                if token not in occurrence:
+                    occurrence[token] = 1
+                else:
+                    occurrence[token] += 1
+
+                if msg[:4].lower() == '+qa ':
+                    out = run_rnn([token], newline_adj=-2)
+                else:
+                    out = run_rnn([token])
+
+                xxx = pipeline.decode(self.model_tokens[out_last:])
+                if '\ufffd' not in xxx:  # avoid utf-8 display issues
+                    response += xxx
+                    out_last = begin + i + 1
+                    if i >= FREE_GEN_LEN:
+                        break
+            response += '\n'
+            save_all_stat(srv, 'gen_1', out)
+
+        else:
+            if msg.lower() == '+':
+                try:
+                    out = self.load_all_stat(srv, 'chat_pre')
+                except:
+                    return
+            else:
+                out = self.load_all_stat(srv, 'chat')
+                msg = msg.strip().replace('\r\n', '\n').replace('\n\n', '\n')
+                new = f"{self.user}{self.interface} {msg}\n\n{self.bot}{self.interface}"
+                out = self.run_rnn(pipeline.encode(new), newline_adj=-999999999)
+                self.save_all_stat(srv, 'chat_pre', out)
+
+            begin = len(self.model_tokens)
+            out_last = begin
+            response += f'{self.bot}{self.interface}'
+            occurrence = {}
+            for i in range(999):
+                if i <= 0:
+                    newline_adj = -999999999
+                elif i <= CHAT_LEN_SHORT:
+                    newline_adj = (i - CHAT_LEN_SHORT) / 10
+                elif i <= CHAT_LEN_LONG:
+                    newline_adj = 0
+                else:
+                    newline_adj = min(3, (i - CHAT_LEN_LONG) * 0.25)  # MUST END THE GENERATION
+
+                for n in occurrence:
+                    out[n] -= (GEN_alpha_presence + occurrence[n] * GEN_alpha_frequency)
+                token = pipeline.sample_logits(
+                    out,
+                    temperature=x_temp,
+                    top_p=x_top_p,
+                )
+
+                if token not in occurrence:
+                    occurrence[token] = 1
+                else:
+                    occurrence[token] += 1
+
+                out = self.run_rnn([token], newline_adj=newline_adj)
+                out[END_OF_TEXT] = -999999999  # disable 
+
+                xxx = pipeline.decode(self.model_tokens[out_last:])
+                if '\ufffd' not in xxx:  # avoid utf-8 display issues
+                    response += xxx
+                    out_last = begin + i + 1
+
+                send_msg = pipeline.decode(self.model_tokens[begin:])
+                if '\n\n' in send_msg:
+                    send_msg = send_msg.strip()
+                    break
+
+            self.save_all_stat(srv, 'chat', out)
+            return response.strip()
 
 ########################################################################################################
+def process_message(user_message,session_id,socketio):
+    # Process the user_message with your chatbot using the generate_response function.
+    logging.info("Processing message: %s", user_message)
+    cs = ChatSession(model, pipeline)   
+    response = cs.generate_response(user_message)
+    logging.info("response message: %s", response)
+    return response
+if CHAT_LANG == 'English':
+    HELP_MSG = '''Commands:
+say something --> chat with bot. use \\n for new line.
++ --> alternate chat reply
++reset --> reset chat
 
-# Run inference
-print(f'\nRun prompt...')
++gen YOUR PROMPT --> free single-round generation with any prompt. use \\n for new line.
++i YOUR INSTRUCT --> free single-round generation with any instruct. use \\n for new line.
++++ --> continue last free generation (only for +gen / +i)
+++ --> retry last free generation (only for +gen / +i)
 
-out = run_rnn(tokenizer.encode(init_prompt))
-save_all_stat('', 'chat_init', out)
-gc.collect()
-torch.cuda.empty_cache()
+Now talk with the bot and enjoy. Remember to +reset periodically to clean up the bot's memory. Use RWKV-4 14B (especially https://huggingface.co/BlinkDL/rwkv-4-raven) for best results.
+'''
+elif CHAT_LANG == 'Chinese':
+    HELP_MSG = f'''指令:
+直接输入内容 --> 和机器人聊天（建议问机器人问题），用\\n代表换行，必须用 Raven 模型
++ --> 让机器人换个回答
++reset --> 重置对话，请经常使用 +reset 重置机器人记忆
 
-srv_list = ['dummy_server']
-for s in srv_list:
-    save_all_stat(s, 'chat', out)
++i 某某指令 --> 问独立的问题（忽略聊天上下文），用\\n代表换行，必须用 Raven 模型
++gen 某某内容 --> 续写内容（忽略聊天上下文），用\\n代表换行，写小说用 testNovel 模型
++++ --> 继续 +gen / +i 的回答
+++ --> 换个 +gen / +i 的回答
 
-def reply_msg(msg):
-    print(f'{bot}{interface} {msg}\n')
+作者：彭博 请关注我的知乎: https://zhuanlan.zhihu.com/p/603840957
+如果喜欢，请看我们的优质护眼灯: https://withablink.taobao.com
 
-def on_message(message):
-    global model_tokens, model_state
+中文 Novel 模型，可以试这些续写例子（不适合 Raven 模型）：
++gen “区区
++gen 以下是不朽的科幻史诗长篇巨著，描写细腻，刻画了数百位个性鲜明的英雄和宏大的星际文明战争。\\n第一章
++gen 这是一个修真世界，详细世界设定如下：\\n1.
+'''
+elif CHAT_LANG == 'Japanese':
+    HELP_MSG = f'''コマンド:
+直接入力 --> ボットとチャットする．改行には\\nを使用してください．
++ --> ボットに前回のチャットの内容を変更させる．
++reset --> 対話のリセット．メモリをリセットするために，+resetを定期的に実行してください．
 
-    srv = 'dummy_server'
++i インストラクトの入力 --> チャットの文脈を無視して独立した質問を行う．改行には\\nを使用してください．
++gen プロンプトの生成 --> チャットの文脈を無視して入力したプロンプトに続く文章を出力する．改行には\\nを使用してください．
++++ --> +gen / +i の出力の回答を続ける．
+++ --> +gen / +i の出力の再生成を行う.
 
-    msg = message.replace('\\n','\n').strip()
-    # if len(msg) > 1000:
-    #     reply_msg('your message is too long (max 1000 tokens)')
-    #     return
+ボットとの会話を楽しんでください。また、定期的に+resetして、ボットのメモリをリセットすることを忘れないようにしてください。
+'''
 
-    x_temp = GEN_TEMP
-    x_top_p = GEN_TOP_P
-    if ("-temp=" in msg):
-        x_temp = float(msg.split("-temp=")[1].split(" ")[0])
-        msg = msg.replace("-temp="+f'{x_temp:g}', "")
-        # print(f"temp: {x_temp}")
-    if ("-top_p=" in msg):
-        x_top_p = float(msg.split("-top_p=")[1].split(" ")[0])
-        msg = msg.replace("-top_p="+f'{x_top_p:g}', "")
-        # print(f"top_p: {x_top_p}")
-    if x_temp <= 0.2:
-        x_temp = 0.2
-    if x_temp >= 5:
-        x_temp = 5
-    if x_top_p <= 0:
-        x_top_p = 0
-    
-    if msg == '+reset':
-        out = load_all_stat('', 'chat_init')
-        save_all_stat(srv, 'chat', out)
-        reply_msg("Chat reset.")
-        return
 
-    elif msg[:5].lower() == '+gen ' or msg[:4].lower() == '+qa ' or msg[:4].lower() == '+qq ' or msg.lower() == '+++' or msg.lower() == '++':
-
-        if msg[:5].lower() == '+gen ':
-            new = '\n' + msg[5:].strip()
-            # print(f'### prompt ###\n[{new}]')
-            model_state = None
-            model_tokens = []
-            out = run_rnn(tokenizer.encode(new))
-            save_all_stat(srv, 'gen_0', out)
-
-        elif msg[:4].lower() == '+qq ':
-            new = '\nQ: ' + msg[4:].strip() + '\nA:'
-            # print(f'### prompt ###\n[{new}]')
-            model_state = None
-            model_tokens = []
-            out = run_rnn(tokenizer.encode(new))
-            save_all_stat(srv, 'gen_0', out)
-
-        elif msg[:4].lower() == '+qa ':
-            out = load_all_stat('', 'chat_init')
-
-            real_msg = msg[4:].strip()
-            new = f"{user}{interface} {real_msg}\n\n{bot}{interface}"
-            # print(f'### qa ###\n[{new}]')
-            
-            out = run_rnn(tokenizer.encode(new))
-            save_all_stat(srv, 'gen_0', out)
-
-        elif msg.lower() == '+++':
-            try:
-                out = load_all_stat(srv, 'gen_1')
-                save_all_stat(srv, 'gen_0', out)
-            except:
-                return
-
-        elif msg.lower() == '++':
-            try:
-                out = load_all_stat(srv, 'gen_0')
-            except:
-                return
-
-        begin = len(model_tokens)
-        out_last = begin
-        for i in range(FREE_GEN_LEN+100):
-            token = tokenizer.sample_logits(
-                out,
-                model_tokens,
-                args.ctx_len,
-                temperature=x_temp,
-                top_p=x_top_p,
-            )
-            if msg[:4].lower() == '+qa ':# or msg[:4].lower() == '+qq ':
-                out = run_rnn([token], newline_adj=-2)
-            else:
-                out = run_rnn([token])
-            
-            xxx = tokenizer.decode(model_tokens[out_last:])
-            if '\ufffd' not in xxx: # avoid utf-8 display issues
-                print(xxx, end='', flush=True)
-                out_last = begin + i + 1
-                if i >= FREE_GEN_LEN:
-                    break
-        print('\n')
-        # send_msg = tokenizer.decode(model_tokens[begin:]).strip()
-        # print(f'### send ###\n[{send_msg}]')
-        # reply_msg(send_msg)
-        save_all_stat(srv, 'gen_1', out)
-
-    else:
-        if msg.lower() == '+':
-            try:
-                out = load_all_stat(srv, 'chat_pre')
-            except:
-                return
-        else:
-            out = load_all_stat(srv, 'chat')
-            new = f"{user}{interface} {msg}\n\n{bot}{interface}"
-            # print(f'### add ###\n[{new}]')
-            out = run_rnn(tokenizer.encode(new), newline_adj=-999999999)
-            save_all_stat(srv, 'chat_pre', out)
-
-        begin = len(model_tokens)
-        out_last = begin
-        print(f'{bot}{interface}', end='', flush=True)
-        for i in range(999):
-            if i <= 0:
-                newline_adj = -999999999
-            elif i <= CHAT_LEN_SHORT:
-                newline_adj = (i - CHAT_LEN_SHORT) / 10
-            elif i <= CHAT_LEN_LONG:
-                newline_adj = 0
-            else:
-                newline_adj = (i - CHAT_LEN_LONG) * 0.25 # MUST END THE GENERATION
-            token = tokenizer.sample_logits(
-                out,
-                model_tokens,
-                args.ctx_len,
-                temperature=x_temp,
-                top_p=x_top_p,
-            )
-            out = run_rnn([token], newline_adj=newline_adj)
-
-            xxx = tokenizer.decode(model_tokens[out_last:])
-            if '\ufffd' not in xxx: # avoid utf-8 display issues
-                print(xxx, end='', flush=True)
-                out_last = begin + i + 1
-            
-            send_msg = tokenizer.decode(model_tokens[begin:])
-            if '\n\n' in send_msg:
-                send_msg = send_msg.strip()
-                break
-            
-            # send_msg = tokenizer.decode(model_tokens[begin:]).strip()
-            # if send_msg.endswith(f'{user}{interface}'): # warning: needs to fix state too !!!
-            #     send_msg = send_msg[:-len(f'{user}{interface}')].strip()
-            #     break
-            # if send_msg.endswith(f'{bot}{interface}'):
-            #     send_msg = send_msg[:-len(f'{bot}{interface}')].strip()
-            #     break
-
-        # print(f'{model_tokens}')
-        # print(f'[{tokenizer.decode(model_tokens)}]')
-
-        # print(f'### send ###\n[{send_msg}]')
-        # reply_msg(send_msg)
-        save_all_stat(srv, 'chat', out)
-
-print(HELP_MSG)
-print(f'Ready - {CHAT_LANG} {args.RUN_DEVICE} {args.FLOAT_MODE} QA_PROMPT={QA_PROMPT} {args.MODEL_NAME}')
-
-print(f'{tokenizer.decode(model_tokens)}'.replace(f'\n\n{bot}',f'\n{bot}'), end='')
-
-while True:
-    msg = prompt(f'{user}{interface} ')
-    if len(msg.strip()) > 0:
-        on_message(msg)
-    else:
-        print('Error: please say something')

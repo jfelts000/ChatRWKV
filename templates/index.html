@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-User Chatbot</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="chat-container">
+    <div id="chat-messages"></div>
+    <div id="loading-overlay" class="overlay">
+      <div class="spinner"></div>
+    </div>
+    <form id="chat-form">
+      <textarea id="user-input" placeholder="Type your message..."></textarea>
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
+  <script>
+    let session_id = "{{ session_id }}";
+  </script>
+  <script src="/static/script.js" defer></script>
+</body>
+</html>
